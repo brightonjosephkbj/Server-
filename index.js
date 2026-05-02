@@ -994,3 +994,67 @@ process.on('SIGTERM', () => {
   Object.values(activeProcesses).forEach(p => { try { p.kill(); } catch {} });
   process.exit(0);
 });
+
+// ─── Auto Cleanup ─────────────────────────────────────────────────────────────
+// Delete files from server after they've been downloaded by user (or after 1 hour)
+
+function cleanupFile(filePath) {
+  if (filePath && fs.existsSync(filePath)) {
+    try { fs.unlinkSync(filePath); } catch {}
+  }
+}
+
+// Run cleanup every 30 minutes — delete files older than 1 hour
+setInterval(() => {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+  // Clean completed downloads older than 1 hour
+  const oldDownloads = db.prepare(`
+    SELECT * FROM downloads 
+    WHERE status='completed' AND updated_at < ?
+  `).all(oneHourAgo);
+
+  oldDownloads.forEach(dl => {
+    cleanupFile(dl.file_path);
+    db.prepare(`UPDATE downloads SET file_path=NULL, status='cleaned' WHERE id=?`).run(dl.id);
+    console.log(`🗑️ Cleaned download: ${dl.title}`);
+  });
+
+  // Clean completed conversions older than 1 hour
+  const oldConversions = db.prepare(`
+    SELECT * FROM conversions 
+    WHERE status='completed' AND updated_at < ?
+  `).all(oneHourAgo);
+
+  oldConversions.forEach(conv => {
+    cleanupFile(conv.output_path);
+    db.prepare(`UPDATE conversions SET output_path=NULL, status='cleaned' WHERE id=?`).run(conv.id);
+  });
+
+  // Clean library items whose files no longer exist
+  const libItems = db.prepare('SELECT * FROM library').all();
+  libItems.forEach(item => {
+    if (item.file_path && !fs.existsSync(item.file_path)) {
+      db.prepare('DELETE FROM library WHERE id=?').run(item.id);
+    }
+  });
+
+  console.log(`🧹 Cleanup done — ${oldDownloads.length} downloads, ${oldConversions.length} conversions cleaned`);
+}, 30 * 60 * 1000); // every 30 minutes
+
+// Also cleanup immediately after file is served
+app.get('/api/downloads/:id/file', (req, res) => {
+  const dl = db.prepare('SELECT * FROM downloads WHERE id=?').get(req.params.id);
+  if (!dl?.file_path || !fs.existsSync(dl.file_path)) return res.status(404).json({ error: 'File not found' });
+  
+  res.download(dl.file_path, `${dl.title}.${path.extname(dl.file_path).slice(1)}`, (err) => {
+    if (!err) {
+      // Delete after successful download
+      setTimeout(() => {
+        cleanupFile(dl.file_path);
+        db.prepare(`UPDATE downloads SET file_path=NULL, status='cleaned' WHERE id=?`).run(dl.id);
+        console.log(`🗑️ Auto-cleaned after download: ${dl.title}`);
+      }, 5000); // 5 second delay to ensure transfer complete
+    }
+  });
+});
