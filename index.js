@@ -26,6 +26,7 @@ db.pragma('foreign_keys = ON');
 db.exec(`
   CREATE TABLE IF NOT EXISTS downloads (
     id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL DEFAULT 'unknown',
     url TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT 'Fetching...',
     platform TEXT DEFAULT 'web',
@@ -45,6 +46,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS library (
     id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL DEFAULT 'unknown',
     download_id TEXT,
     title TEXT NOT NULL,
     type TEXT NOT NULL DEFAULT 'video',
@@ -231,8 +233,8 @@ function startDownload(id, url, format, quality) {
         const dl = db.prepare('SELECT * FROM downloads WHERE id=?').get(id);
         const audioExts = ['mp3', 'aac', 'flac', 'm4a', 'opus', 'wav'];
         const type = audioExts.includes(ext) ? 'audio' : 'video';
-        db.prepare(`INSERT INTO library (id, download_id, title, type, source, format, file_size, file_path, thumbnail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-          .run(randomUUID(), id, dl.title, type, dl.platform, ext, stats.size, filePath, dl.thumbnail);
+        db.prepare(`INSERT INTO library (id, device_id, download_id, title, type, source, format, file_size, file_path, thumbnail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(randomUUID(), dl.device_id, id, dl.title, type, dl.platform, ext, stats.size, filePath, dl.thumbnail);
       }
     } else {
       db.prepare(`UPDATE downloads SET status='failed', error_message='Download failed. Check the URL and try again.', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
@@ -273,15 +275,18 @@ app.post('/api/info', async (req, res) => {
 // ─── Downloads ────────────────────────────────────────────────────────────────
 
 app.get('/api/downloads', (req, res) => {
-  const { status, limit = 50 } = req.query;
+  const { status, limit = 50, device_id } = req.query;
+  if (!device_id) return res.status(400).json({ error: 'device_id is required' });
   const rows = status
-    ? db.prepare('SELECT * FROM downloads WHERE status=? ORDER BY created_at DESC LIMIT ?').all(status, +limit)
-    : db.prepare('SELECT * FROM downloads ORDER BY created_at DESC LIMIT ?').all(+limit);
+    ? db.prepare('SELECT * FROM downloads WHERE device_id=? AND status=? ORDER BY created_at DESC LIMIT ?').all(device_id, status, +limit)
+    : db.prepare('SELECT * FROM downloads WHERE device_id=? ORDER BY created_at DESC LIMIT ?').all(device_id, +limit);
   res.json(rows);
 });
 
-app.get('/api/downloads/active', (_, res) => {
-  res.json(db.prepare(`SELECT * FROM downloads WHERE status IN ('pending','downloading','paused') ORDER BY created_at DESC`).all());
+app.get('/api/downloads/active', (req, res) => {
+  const { device_id } = req.query;
+  if (!device_id) return res.status(400).json({ error: 'device_id is required' });
+  res.json(db.prepare(`SELECT * FROM downloads WHERE device_id=? AND status IN ('pending','downloading','paused') ORDER BY created_at DESC`).all(device_id));
 });
 
 app.get('/api/downloads/:id', (req, res) => {
@@ -291,14 +296,14 @@ app.get('/api/downloads/:id', (req, res) => {
 });
 
 app.post('/api/downloads', async (req, res) => {
-  const { url, format = 'mp4', quality = '720p' } = req.body;
+  const { url, format = 'mp4', quality = '720p', device_id = 'unknown' } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
   const id = randomUUID();
   const platform = detectPlatform(url);
 
-  db.prepare(`INSERT INTO downloads (id, url, title, platform, format, quality, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')`)
-    .run(id, url, 'Fetching title...', platform, format, quality);
+  db.prepare(`INSERT INTO downloads (id, device_id, url, title, platform, format, quality, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`)
+    .run(id, device_id, url, 'Fetching title...', platform, format, quality);
 
   fetchVideoInfo(url).then(info => {
     db.prepare(`UPDATE downloads SET title=?, thumbnail=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
@@ -347,12 +352,13 @@ app.get('/api/downloads/:id/file', (req, res) => {
 // ─── Library ──────────────────────────────────────────────────────────────────
 
 app.get('/api/library', (req, res) => {
-  const { type, source, q } = req.query;
-  const conds = [], params = [];
+  const { type, source, q, device_id } = req.query;
+  if (!device_id) return res.status(400).json({ error: 'device_id is required' });
+  const conds = ['device_id=?'], params = [device_id];
   if (type)   { conds.push('type=?'); params.push(type); }
   if (source) { conds.push('source=?'); params.push(source); }
   if (q)      { conds.push('(title LIKE ? OR artist LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
-  const where = conds.length ? ' WHERE ' + conds.join(' AND ') : '';
+  const where = ' WHERE ' + conds.join(' AND ');
   res.json(db.prepare(`SELECT * FROM library${where} ORDER BY created_at DESC`).all(...params));
 });
 
