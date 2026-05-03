@@ -190,6 +190,7 @@ function startDownload(id, url, format, quality) {
     '--geo-bypass',
     '--retries', '3',
     '--fragment-retries', '3',
+    '--cookies', path.join(process.cwd(), 'youtube_cookies.txt'),
   ];
 
   if (isAudio) {
