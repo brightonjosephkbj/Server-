@@ -512,6 +512,8 @@ app.get('/api/library/:id/stream', (req, res) => {
   const audioExts = ['mp3', 'aac', 'flac', 'm4a', 'wav', 'opus'];
   const contentType = audioExts.includes(ext) ? `audio/${ext === 'mp3' ? 'mpeg' : ext}` : 'video/mp4';
 
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Content-Type, Accept-Ranges');
   if (range) {
     const [s, e] = range.replace(/bytes=/, '').split('-').map(Number);
     const end = e || Math.min(s + 1024 * 1024 * 2, stat.size - 1);
@@ -1126,9 +1128,9 @@ function cleanupFile(filePath) {
 
 // Run cleanup every 30 minutes — delete files older than 1 hour
 setInterval(() => {
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const oneHourAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-  // Clean completed downloads older than 1 hour
+  // Clean completed downloads older than 24 hours
   const oldDownloads = db.prepare(`
     SELECT * FROM downloads 
     WHERE status='completed' AND updated_at < ?
@@ -1167,14 +1169,10 @@ app.get('/api/downloads/:id/file', (req, res) => {
   const dl = db.prepare('SELECT * FROM downloads WHERE id=?').get(req.params.id);
   if (!dl?.file_path || !fs.existsSync(dl.file_path)) return res.status(404).json({ error: 'File not found' });
   
-  res.download(dl.file_path, `${dl.title}.${path.extname(dl.file_path).slice(1)}`, (err) => {
-    if (!err) {
-      // Delete after successful download
-      setTimeout(() => {
-        cleanupFile(dl.file_path);
-        db.prepare(`UPDATE downloads SET file_path=NULL, status='cleaned' WHERE id=?`).run(dl.id);
-        console.log(`🗑️ Auto-cleaned after download: ${dl.title}`);
-      }, 5000); // 5 second delay to ensure transfer complete
-    }
-  });
+  // Add CORS headers so browser fetch() can download the file
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type');
+  res.download(dl.file_path, `${dl.title}.${path.extname(dl.file_path).slice(1)}`);
+  // NOTE: file is NOT deleted after download — cleanup runs every 30min for files older than 24hrs
 });
