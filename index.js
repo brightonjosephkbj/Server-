@@ -105,11 +105,12 @@ function detectPlatform(url) {
 
 function buildFormatStr(format, quality) {
   const audioFormats = ['mp3', 'aac', 'flac', 'm4a', 'opus', 'wav'];
-  if (audioFormats.includes(format)) return 'bestaudio/best';
+  if (audioFormats.includes(format)) return 'bestaudio[ext=m4a]/bestaudio/best';
   const heightMap = { '360p': 360, '480p': 480, '720p': 720, '1080p': 1080, '1440p': 1440, '2160p': 2160, '4k': 2160 };
   const h = heightMap[quality?.toLowerCase()];
-  if (h) return `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
-  return 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best';
+  // FIX: Don't require ext=mp4 — YouTube stopped serving native mp4 for most qualities
+  if (h) return `bestvideo[height<=${h}]+bestaudio/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
+  return 'bestvideo+bestaudio/best';
 }
 
 function fetchVideoInfo(url) {
@@ -174,24 +175,101 @@ function runFfmpeg(args, onProgress) {
   });
 }
 
+
+// ─── Cobalt API Fallback ──────────────────────────────────────────────────────
+async function downloadViaCobalt(id, url, format) {
+  const audioFormats = ['mp3','aac','flac','m4a','opus','wav'];
+  const isAudio = audioFormats.includes(format);
+  
+  const cobaltUrl = 'https://api.cobalt.tools/';
+  const body = {
+    url,
+    downloadMode: isAudio ? 'audio' : 'auto',
+    audioFormat: isAudio ? (format === 'mp3' ? 'mp3' : 'best') : 'best',
+    videoQuality: '720',
+    filenameStyle: 'basic',
+  };
+
+  const res = await axios.post(cobaltUrl, body, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    timeout: 30000,
+  });
+
+  const data = res.data;
+  if(data.status !== 'stream' && data.status !== 'redirect' && data.status !== 'tunnel') {
+    throw new Error('Cobalt: ' + (data.error?.code || 'Unknown error'));
+  }
+
+  const fileUrl = data.url;
+  const ext = isAudio ? (format || 'mp3') : 'mp4';
+  const outPath = path.join(DOWNLOADS_DIR, `${id}.${ext}`);
+
+  db.prepare(`UPDATE downloads SET status='downloading', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).run(id);
+
+  const fileRes = await axios({
+    method: 'GET',
+    url: fileUrl,
+    responseType: 'stream',
+    timeout: 120000,
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+  });
+
+  const totalSize = parseInt(fileRes.headers['content-length'] || '0');
+  let downloaded = 0;
+
+  const writer = fs.createWriteStream(outPath);
+  fileRes.data.on('data', chunk => {
+    downloaded += chunk.length;
+    if(totalSize > 0) {
+      const progress = Math.min(Math.round((downloaded/totalSize)*100), 99);
+      db.prepare(`UPDATE downloads SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).run(progress, id);
+    }
+  });
+  fileRes.data.pipe(writer);
+
+  await new Promise((resolve, reject) => {
+    writer.on('finish', resolve);
+    writer.on('error', reject);
+  });
+
+  return { filePath: outPath, ext };
+}
+
 function startDownload(id, url, format, quality) {
   const audioFormats = ['mp3', 'aac', 'flac', 'm4a', 'opus', 'wav'];
   const isAudio = audioFormats.includes(format);
   const outTemplate = path.join(DOWNLOADS_DIR, `${id}.%(ext)s`);
   const formatStr = buildFormatStr(format, quality);
 
+  // FIX: Check cookies file exists before passing it — missing file crashes yt-dlp
+  const cookiesPath = path.join(process.cwd(), 'youtube_cookies.txt');
+  const hasCookies = fs.existsSync(cookiesPath) && fs.statSync(cookiesPath).size > 10;
+
   const args = [
     '--format', formatStr,
     '--output', outTemplate,
-    '--no-playlist', '--newline', '--no-warnings', '--progress',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    '--extractor-args', 'youtube:player_client=web,mweb;player_skip=js',
+    '--no-playlist', '--newline', '--progress',
+    // FIX: android player_client bypasses YouTube bot detection (web/mweb blocked in 2025)
+    '--extractor-args', 'youtube:player_client=android,ios,web',
+    '--user-agent', 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+    '--add-header', 'Accept-Language:en-US,en;q=0.9',
     '--no-check-certificate',
     '--geo-bypass',
-    '--retries', '3',
-    '--fragment-retries', '3',
-    '--cookies', path.join(process.cwd(), 'youtube_cookies.txt'),
+    '--retries', '5',
+    '--fragment-retries', '5',
+    '--retry-sleep', 'fragment:exp=1:3:10',
+    '--socket-timeout', '30',
   ];
+
+  if (hasCookies) {
+    args.push('--cookies', cookiesPath);
+    console.log(`[${id}] Using cookies file`);
+  } else {
+    console.log(`[${id}] No cookies file — downloading without auth`);
+  }
 
   if (isAudio) {
     args.push('--extract-audio', '--audio-format', format, '--audio-quality', '0');
@@ -205,6 +283,16 @@ function startDownload(id, url, format, quality) {
   activeProcesses[id] = proc;
 
   db.prepare(`UPDATE downloads SET status='downloading', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).run(id);
+
+  let stderrBuf = '';
+  proc.stderr.on('data', data => {
+    const line = data.toString();
+    stderrBuf += line;
+    // Log real errors to console so Render logs show them
+    if (line.includes('ERROR') || line.includes('error') || line.includes('Warning')) {
+      console.log(`[yt-dlp][${id}] ${line.trim()}`);
+    }
+  });
 
   proc.stdout.on('data', data => {
     const line = data.toString();
@@ -229,6 +317,7 @@ function startDownload(id, url, format, quality) {
 
   proc.on('close', code => {
     delete activeProcesses[id];
+    console.log(`[${id}] yt-dlp exited with code ${code}`);
     if (code === 0) {
       const files = fs.readdirSync(DOWNLOADS_DIR).filter(f => f.startsWith(id + '.'));
       if (files.length > 0) {
@@ -244,8 +333,26 @@ function startDownload(id, url, format, quality) {
           .run(randomUUID(), dl.device_id, id, dl.title, type, dl.platform, ext, stats.size, filePath, dl.thumbnail);
       }
     } else {
-      db.prepare(`UPDATE downloads SET status='failed', error_message='Download failed. Check the URL and try again.', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
-        .run(id);
+      // yt-dlp failed — try Cobalt API fallback
+      console.log(`yt-dlp failed for ${id}, trying Cobalt fallback...`);
+      db.prepare(`UPDATE downloads SET error_message='Trying alternative downloader...', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`).run(id);
+      const dl = db.prepare('SELECT * FROM downloads WHERE id=?').get(id);
+      downloadViaCobalt(id, dl.url, dl.format)
+        .then(({ filePath, ext }) => {
+          const stats = fs.statSync(filePath);
+          db.prepare(`UPDATE downloads SET status='completed', progress=100, file_path=?, file_size=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
+            .run(filePath, stats.size, id);
+          const audioExts = ['mp3', 'aac', 'flac', 'm4a', 'opus', 'wav'];
+          const type = audioExts.includes(ext) ? 'audio' : 'video';
+          db.prepare(`INSERT INTO library (id, device_id, download_id, title, type, source, format, file_size, file_path, thumbnail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(randomUUID(), dl.device_id, id, dl.title, type, dl.platform, ext, stats.size, filePath, dl.thumbnail);
+          console.log(`Cobalt fallback succeeded for ${id}`);
+        })
+        .catch(err => {
+          console.log(`Cobalt fallback also failed for ${id}:`, err.message);
+          db.prepare(`UPDATE downloads SET status='failed', error_message=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?`)
+            .run('Download failed: ' + err.message, id);
+        });
     }
   });
 
